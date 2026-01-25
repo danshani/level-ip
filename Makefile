@@ -1,4 +1,7 @@
-CPPFLAGS = -I include -Wall -Werror -pthread
+CPPFLAGS = -I include -Wall -Werror -pthread \
+           -Wno-error=address-of-packed-member \
+           -Wno-error=stringop-overread \
+           -Wno-error=address
 
 src = $(wildcard src/*.c)
 obj = $(patsubst src/%.c, build/%.o, $(src))
