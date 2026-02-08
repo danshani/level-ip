@@ -31,15 +31,15 @@ TAP_IFACE   = "tap0"
 HOST_IP     = "10.0.0.5"
 STACK_IP    = "10.0.0.4"
 TEST_PORT   = 8080
-PAYLOAD     = 200 * 1024   # 200KB
+PAYLOAD     = 2 * 1024 * 1024   # 2MB
 
 FEC_HDR_FMT = "!HBBHIH"
 FEC_HDR_LEN = struct.calcsize(FEC_HDR_FMT)
 FEC_FEEDBACK_IDX = 0xFF
 
 # Phase boundaries (block count thresholds from sniffer's view)
-PHASE2_BLOCK = 5     # inject 10% after 5 blocks
-PHASE3_BLOCK = 15    # inject 20% after 15 blocks
+PHASE2_BLOCK = 10     # inject 10% after 10 blocks
+PHASE3_BLOCK = 40     # inject 20% after 40 blocks
 
 
 def inject_feedback(loss_pct, stack_port):
@@ -170,7 +170,7 @@ def run_test():
     sniff_done = threading.Event()
     def sniffer():
         sniff(iface=TAP_IFACE, filter="tcp", prn=on_packet,
-              store=0, timeout=60, stop_filter=lambda p: sniff_done.is_set())
+              store=0, timeout=180, stop_filter=lambda p: sniff_done.is_set())
     sniff_thread = threading.Thread(target=sniffer, daemon=True)
     sniff_thread.start()
     time.sleep(0.5)
@@ -180,7 +180,7 @@ def run_test():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST_IP, TEST_PORT))
     srv.listen(1)
-    srv.settimeout(45)
+    srv.settimeout(120)
 
     # Launch sender
     sender_cmd = [
@@ -198,7 +198,7 @@ def run_test():
     try:
         conn, addr = srv.accept()
         print(f"  Connected from {addr}")
-        conn.settimeout(30)
+        conn.settimeout(60)
         while True:
             try:
                 chunk = conn.recv(16384)

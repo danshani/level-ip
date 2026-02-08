@@ -88,7 +88,7 @@ int main(int argc, char **argv)
         sent += n;
         printf("Sent %d / %d bytes\n", sent, payload_size);
         if (sent < payload_size)
-            usleep(30000);  /* 30ms between chunks for feedback processing */
+            usleep(15000);  /* 15ms between chunks for feedback processing */
     }
 
     printf("Done sending. Waiting for ACK...\n");
