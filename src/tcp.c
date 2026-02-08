@@ -6,6 +6,7 @@
 #include "utils.h"
 #include "timer.h"
 #include "wait.h"
+#include "fec.h"
 
 #ifdef DEBUG_TCP
 const char *tcp_dbg_states[] = {
@@ -54,6 +55,57 @@ static void tcp_clear_queues(struct tcp_sock *tsk) {
     skb_queue_free(&tsk->ofo_queue);
 }
 
+/*
+ * Handle an incoming FEC parity packet: extract fec_hdr, store parity,
+ * and attempt reconstruction if enough data+parity is available.
+ */
+static void tcp_fec_handle_parity(struct sock *sk, struct sk_buff *skb,
+                                  struct tcphdr *th, struct iphdr *iph)
+{
+    struct tcp_sock *tsk = tcp_sk(sk);
+    struct fec_state *fs = &tsk->fec;
+    if (!fs->enabled) goto drop;
+
+    uint32_t payload_len = ip_len(iph) - tcp_hlen(th);
+    if (payload_len < FEC_HDR_LEN) goto drop;
+
+    struct fec_hdr *fh = (struct fec_hdr *)th->data;
+    uint16_t block_id = ntohs(fh->block_id);
+    uint8_t parity_idx = fh->seq_idx;
+    uint16_t symbol_len = ntohs(fh->symbol_len);
+    uint16_t parity_data_len = payload_len - FEC_HDR_LEN;
+
+    struct fec_rx_block *rxb = &fs->rx_block;
+
+    /* If this is a new block, reset */
+    if (block_id != rxb->block_id) {
+        fec_rx_reset_block(rxb, block_id);
+    }
+
+    fec_rx_add_parity(rxb, parity_idx, th->data + FEC_HDR_LEN,
+                      parity_data_len, symbol_len);
+
+    print_err("FEC-RX: Got parity block=%u idx=%u (data=%d parity=%d)\n",
+              block_id, parity_idx, rxb->data_count, rxb->parity_count);
+
+    /* Attempt recovery if we have gaps */
+    if (rxb->data_count < RS_K && fec_rx_can_recover(rxb)) {
+        if (fec_rx_recover(rxb) == 0) {
+            print_err("FEC-RX: Recovered missing packets in block %u!\n",
+                      block_id);
+
+            /* Ghost-inject recovered packets into the TCP receive path.
+             * A full implementation would store per-packet seq numbers
+             * in fec_rx_block to synthesize proper sk_buffs and inject
+             * them via tcp_data_queue, then force an ACK.  This is the
+             * hook point for that logic. */
+        }
+    }
+
+drop:
+    free_skb(skb);
+}
+
 void tcp_in(struct sk_buff *skb)
 {
     struct sock *sk;
@@ -74,6 +126,25 @@ void tcp_in(struct sk_buff *skb)
         return;
     }
     socket_wr_acquire(sk->sock);
+
+    /* Intercept FEC parity packets before normal TCP processing */
+    if (th->fec_flag) {
+        tcp_fec_handle_parity(sk, skb, th, iph);
+        socket_release(sk->sock);
+        return;
+    }
+
+    /* For data packets, also track them in the FEC RX block */
+    if (tcp_sk(sk)->fec.enabled && skb->dlen > 0) {
+        struct fec_rx_block *rxb = &tcp_sk(sk)->fec.rx_block;
+        /* Determine the data index within the current FEC block.
+         * This is a simplified mapping — in practice a more robust
+         * block-tracking mechanism would be needed. */
+        int idx = rxb->data_count;
+        if (idx < RS_K) {
+            fec_rx_add_data(rxb, idx, skb->payload, skb->dlen);
+        }
+    }
 
     tcp_in_dbg(th, sk, skb);
     /* if (tcp_checksum(iph, th) != 0) { */
@@ -115,6 +186,9 @@ struct sock *tcp_alloc_sock()
     tsk->smss = 536;
 
     skb_queue_init(&tsk->ofo_queue);
+
+    /* Initialize FEC state */
+    fec_init(&tsk->fec);
     
     return (struct sock *)tsk;
 }

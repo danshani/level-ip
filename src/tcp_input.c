@@ -3,6 +3,7 @@
 #include "tcp_data.h"
 #include "skbuff.h"
 #include "sock.h"
+#include "fec.h"
 
 static int tcp_parse_opts(struct tcp_sock *tsk, struct tcphdr *th)
 {

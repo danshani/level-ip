@@ -4,6 +4,11 @@
 #include "ip.h"
 #include "skbuff.h"
 #include "timer.h"
+#include "fec.h"
+
+/* Drop DEBUG_LOSS_RATE percent of outgoing data packets (never parity) */
+#define DEBUG_LOSS_RATE 5
+static int loss_sim_inited = 0;
 
 static void *tcp_retransmission_timeout(void *arg);
 
@@ -124,7 +129,19 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, uint32_t seq)
     thdr->csum = htons(thdr->csum);
     thdr->urp = htons(thdr->urp);
     thdr->csum = tcp_v4_checksum(skb, htonl(sk->saddr), htonl(sk->daddr));
-    
+
+    /* Loss simulation: drop DEBUG_LOSS_RATE% of data packets (not parity) */
+    if (DEBUG_LOSS_RATE > 0 && thdr->fec_flag == 0 && skb->dlen > 0) {
+        if (!loss_sim_inited) {
+            srand((unsigned)time(NULL));
+            loss_sim_inited = 1;
+        }
+        if ((rand() % 100) < DEBUG_LOSS_RATE) {
+            print_err("FEC-LOSS-SIM: Dropping data packet seq=%u\n", seq);
+            return 0; /* pretend it was sent */
+        }
+    }
+
     return ip_output(sk, skb);
 }
 
@@ -442,6 +459,44 @@ int tcp_connect(struct sock *sk)
     return rc;
 }
 
+/*
+ * Send one FEC parity packet.  Uses the same TCP header structure but
+ * sets fec_flag=1 and prepends a small fec_hdr to the payload.
+ */
+static int tcp_send_fec_parity(struct sock *sk, uint16_t block_id,
+                               uint8_t parity_idx, const uint8_t *parity_data,
+                               uint16_t parity_len, uint16_t symbol_len)
+{
+    struct tcp_sock *tsk = tcp_sk(sk);
+    struct tcb *tcb = &tsk->tcb;
+    uint16_t total = FEC_HDR_LEN + parity_len;
+
+    struct sk_buff *skb = alloc_skb(ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN + total);
+    skb_reserve(skb, ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN + total);
+    skb->protocol = IP_TCP;
+    skb->dlen = total;
+    skb->seq = 0;
+
+    /* Build payload: fec_hdr + parity data */
+    skb_push(skb, total);
+    struct fec_hdr *fh = (struct fec_hdr *)skb->data;
+    fh->block_id = htons(block_id);
+    fh->seq_idx = parity_idx;
+    fh->pad_len = 0;
+    fh->symbol_len = htons(symbol_len);
+    memcpy(skb->data + FEC_HDR_LEN, parity_data, parity_len);
+
+    struct tcphdr *th = tcp_hdr(skb);
+    th->ack = 1;
+    th->fec_flag = 1; /* Mark as parity packet */
+
+    /* Transmit without queueing for retransmission (parity is fire-and-forget) */
+    int rc = tcp_transmit_skb(sk, skb, tcb->snd_nxt);
+    /* Do NOT advance snd_nxt – parity occupies no sequence space */
+    free_skb(skb);
+    return rc;
+}
+
 int tcp_send(struct tcp_sock *tsk, const void *buf, int len)
 {
     struct sk_buff *skb;
@@ -449,6 +504,7 @@ int tcp_send(struct tcp_sock *tsk, const void *buf, int len)
     int slen = len;
     int mss = tsk->smss;
     int dlen = 0;
+    struct sock *sk = &tsk->sk;
 
     while (slen > 0) {
         dlen = slen > mss ? mss : slen;
@@ -462,13 +518,35 @@ int tcp_send(struct tcp_sock *tsk, const void *buf, int len)
 
         th = tcp_hdr(skb);
         th->ack = 1;
+        th->fec_flag = 0; /* data packet */
 
         if (slen == 0) {
             th->psh = 1;
         }
 
-        if (tcp_queue_transmit_skb(&tsk->sk, skb) == -1) {
+        if (tcp_queue_transmit_skb(sk, skb) == -1) {
             perror("Error on TCP skb queueing");
+        }
+
+        /* Buffer this data packet for FEC encoding */
+        if (tsk->fec.enabled) {
+            struct fec_tx_block *fblk = &tsk->fec.tx_block;
+            int full = fec_tx_buffer_packet(fblk, skb->data + (skb->end - skb->data - skb->dlen),
+                                            dlen, skb->seq);
+            /* When block is full, generate and send parity packets */
+            if (full) {
+                uint8_t *parity_bufs[RS_PARITY];
+                uint16_t sym_len;
+                fec_tx_generate_parity(fblk, parity_bufs, &sym_len);
+
+                for (int p = 0; p < RS_PARITY; p++) {
+                    tcp_send_fec_parity(sk, fblk->block_id, p,
+                                        parity_bufs[p], sym_len, sym_len);
+                    free(parity_bufs[p]);
+                }
+
+                fec_tx_reset_block(fblk, fblk->block_id + 1);
+            }
         }
     }
 
