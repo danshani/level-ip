@@ -468,7 +468,7 @@ static int tcp_send_fec_parity(struct sock *sk, uint16_t block_id,
                                uint16_t parity_len, uint16_t symbol_len)
 {
     struct tcp_sock *tsk = tcp_sk(sk);
-    struct tcb *tcb = &tsk->tcb;
+    (void)tsk;
     uint16_t total = FEC_HDR_LEN + parity_len;
 
     struct sk_buff *skb = alloc_skb(ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN + total);
@@ -490,9 +490,10 @@ static int tcp_send_fec_parity(struct sock *sk, uint16_t block_id,
     th->ack = 1;
     th->fec_flag = 1; /* Mark as parity packet */
 
-    /* Transmit without queueing for retransmission (parity is fire-and-forget) */
-    int rc = tcp_transmit_skb(sk, skb, tcb->snd_nxt);
-    /* Do NOT advance snd_nxt – parity occupies no sequence space */
+    /* Use seq=0 so the parity packet is far out of the receiver's window.
+     * A standard TCP stack will silently drop it as "out of window."
+     * A level-ip receiver intercepts the fec_flag before any seq checks. */
+    int rc = tcp_transmit_skb(sk, skb, 0);
     free_skb(skb);
     return rc;
 }
