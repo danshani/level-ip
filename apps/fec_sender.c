@@ -11,7 +11,7 @@
 #include <sys/socket.h>
 #include <netdb.h>
 
-#define PAYLOAD_SIZE 8192  /* Large enough for multiple FEC blocks */
+#define DEFAULT_PAYLOAD_SIZE 8192
 
 int get_address(char *host, char *port, struct sockaddr *addr)
 {
@@ -35,9 +35,18 @@ int get_address(char *host, char *port, struct sockaddr *addr)
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        printf("Usage: %s <host> <port>\n", argv[0]);
+    if (argc < 3) {
+        printf("Usage: %s <host> <port> [size_bytes]\n", argv[0]);
         return 1;
+    }
+
+    int payload_size = DEFAULT_PAYLOAD_SIZE;
+    if (argc >= 4) {
+        payload_size = atoi(argv[3]);
+        if (payload_size <= 0 || payload_size > 10*1024*1024) {
+            printf("Invalid size (max 10MB)\n");
+            return 1;
+        }
     }
 
     struct sockaddr addr;
@@ -54,23 +63,32 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    printf("Connected, sending %d bytes...\n", PAYLOAD_SIZE);
+    printf("Connected, sending %d bytes...\n", payload_size);
 
     /* Build a recognizable payload pattern */
-    char buf[PAYLOAD_SIZE];
-    for (int i = 0; i < PAYLOAD_SIZE; i++) {
+    char *buf = malloc(payload_size);
+    if (!buf) { perror("malloc"); return 1; }
+    for (int i = 0; i < payload_size; i++) {
         buf[i] = 'A' + (i % 26);
     }
 
+    /* Write in small chunks (~1 FEC block = 5*MSS ≈ 7500 bytes)
+     * so the socket write-lock is released between chunks, allowing
+     * the RX thread to process feedback packets for adaptive FEC. */
+    int chunk = 7500;
     int sent = 0;
-    while (sent < PAYLOAD_SIZE) {
-        int n = write(sock, buf + sent, PAYLOAD_SIZE - sent);
+    while (sent < payload_size) {
+        int to_send = payload_size - sent;
+        if (to_send > chunk) to_send = chunk;
+        int n = write(sock, buf + sent, to_send);
         if (n <= 0) {
             perror("write");
             break;
         }
         sent += n;
-        printf("Sent %d / %d bytes\n", sent, PAYLOAD_SIZE);
+        printf("Sent %d / %d bytes\n", sent, payload_size);
+        if (sent < payload_size)
+            usleep(30000);  /* 30ms between chunks for feedback processing */
     }
 
     printf("Done sending. Waiting for ACK...\n");
@@ -79,6 +97,7 @@ int main(int argc, char **argv)
     read(sock, ack, sizeof(ack));
     printf("Server response: %s\n", ack);
 
+    free(buf);
     close(sock);
     return 0;
 }
