@@ -205,3 +205,26 @@ uint32_t fec_rx_seq_for_index(struct fec_rx_block *blk, int index)
     /* Otherwise compute from block_seq_start + index * mss */
     return blk->block_seq_start + (uint32_t)index * blk->mss;
 }
+
+uint8_t fec_rx_block_loss_pct(struct fec_state *fs)
+{
+    struct fec_rx_block *rxb = &fs->rx_block;
+
+    fs->rx_blocks_expected += RS_K;
+    fs->rx_blocks_received += rxb->data_count;
+
+    if (fs->rx_blocks_expected == 0)
+        return 0;
+
+    uint32_t missing = fs->rx_blocks_expected - fs->rx_blocks_received;
+    return (uint8_t)((missing * 100) / fs->rx_blocks_expected);
+}
+
+int fec_target_parity(uint8_t peer_loss_pct)
+{
+    if (peer_loss_pct < 5)
+        return 0;   /* pure TCP */
+    if (peer_loss_pct < 15)
+        return 1;   /* light FEC */
+    return 2;        /* full FEC */
+}

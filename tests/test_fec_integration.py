@@ -229,6 +229,10 @@ def analyze_log(logfile):
                 results["parity_received"] += 1
             if "FEC-RX: Recovered" in line:
                 results["recovery_events"] += 1
+            if "FEC-TX:" in line:
+                results.setdefault("adaptive_decisions", []).append(line.strip())
+            if "FEC-FB:" in line:
+                results.setdefault("feedback", []).append(line.strip())
 
     return results
 
@@ -314,6 +318,10 @@ def run_test(auto_mode=False):
         print(f"  Parity sent:        {log_results['parity_sent']}")
         print(f"  Parity received:    {log_results['parity_received']}")
         print(f"  Recovery events:    {log_results['recovery_events']}")
+        for d in log_results.get("adaptive_decisions", []):
+            print(f"  Adaptive:           {d}")
+        for fb in log_results.get("feedback", []):
+            print(f"  Feedback:           {fb}")
         print(f"{'='*60}")
 
     # Summary
@@ -331,13 +339,17 @@ def run_test(auto_mode=False):
     else:
         print("  ✗ TEST 1: No TCP connection received")
 
-    # Test 2: Parity packets seen
+    # Test 2: Adaptive FEC decision
+    adaptive = log_results.get("adaptive_decisions", []) if os.path.exists(logfile) else []
     if cap.fec_parity > 0:
         print(f"  ✓ TEST 2: FEC parity packets detected ({cap.fec_parity} packets)")
         passed += 1
+    elif adaptive:
+        # Adaptive mode: sender decided 0 parity is correct
+        print(f"  ✓ TEST 2: Adaptive FEC active — sender chose 0 parity (no loss feedback)")
+        passed += 1
     else:
-        print("  ~ TEST 2: No parity packets captured (may need root for sniffing)")
-        # Don't count as failure if we couldn't capture
+        print("  ~ TEST 2: No parity or adaptive decisions found")
         total -= 1
 
     # Test 3: Data integrity

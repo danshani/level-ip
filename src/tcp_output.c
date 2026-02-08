@@ -499,6 +499,32 @@ static int tcp_send_fec_parity(struct sock *sk, uint16_t block_id,
     return rc;
 }
 
+void tcp_send_fec_feedback(struct sock *sk, uint8_t loss_pct)
+{
+    uint16_t total = FEC_HDR_LEN + 1; /* fec_hdr + 1 byte loss */
+
+    struct sk_buff *skb = alloc_skb(ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN + total);
+    skb_reserve(skb, ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN + total);
+    skb->protocol = IP_TCP;
+    skb->dlen = total;
+    skb->seq = 0;
+
+    skb_push(skb, total);
+    struct fec_hdr *fh = (struct fec_hdr *)skb->data;
+    memset(fh, 0, FEC_HDR_LEN);
+    fh->seq_idx = FEC_FEEDBACK_IDX;
+    skb->data[FEC_HDR_LEN] = loss_pct;
+
+    struct tcphdr *th = tcp_hdr(skb);
+    th->ack = 1;
+    th->fec_flag = 1;
+
+    tcp_transmit_skb(sk, skb, 0);
+    free_skb(skb);
+
+    print_err("FEC-FB: sent feedback loss_pct=%u%%\n", loss_pct);
+}
+
 int tcp_send(struct tcp_sock *tsk, const void *buf, int len)
 {
     struct sk_buff *skb;
@@ -535,16 +561,23 @@ int tcp_send(struct tcp_sock *tsk, const void *buf, int len)
             struct fec_tx_block *fblk = &tsk->fec.tx_block;
             int full = fec_tx_buffer_packet(fblk, skb->data + (skb->end - skb->data - skb->dlen),
                                             dlen, skb->seq);
-            /* When block is full, generate and send parity packets */
+            /* When block is full, generate parity and send based on loss */
             if (full) {
                 uint8_t *parity_bufs[RS_PARITY];
                 uint16_t sym_len;
                 fec_tx_generate_parity(fblk, parity_bufs, &sym_len);
 
+                int target = fec_target_parity(tsk->fec.peer_loss_pct);
+                print_err("FEC-TX: block=%u loss=%u%% target_parity=%d/%d\n",
+                          fblk->block_id, tsk->fec.peer_loss_pct,
+                          target, RS_PARITY);
+
                 for (int p = 0; p < RS_PARITY; p++) {
-                    tcp_send_fec_parity(sk, fblk->block_id, p,
-                                        parity_bufs[p], sym_len, sym_len,
-                                        fblk->data_seqs[0], mss);
+                    if (p < target) {
+                        tcp_send_fec_parity(sk, fblk->block_id, p,
+                                            parity_bufs[p], sym_len, sym_len,
+                                            fblk->data_seqs[0], mss);
+                    }
                     free(parity_bufs[p]);
                 }
 

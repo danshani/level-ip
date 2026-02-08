@@ -52,14 +52,23 @@ struct fec_rx_block {
 };
 
 /*
+ * Sentinel value for seq_idx in fec_hdr: marks a feedback packet
+ * carrying loss statistics from receiver to sender.
+ */
+#define FEC_FEEDBACK_IDX 0xFF
+
+/*
  * Per-socket FEC state, embedded in tcp_sock.
  */
 struct fec_state {
     int enabled;
     /* TX side */
     struct fec_tx_block tx_block;
+    uint8_t  peer_loss_pct;         /* last loss % reported by receiver */
     /* RX side */
     struct fec_rx_block rx_block;
+    uint32_t rx_blocks_expected;    /* running total: blocks × RS_K */
+    uint32_t rx_blocks_received;    /* running total: data packets received */
 };
 
 /* API */
@@ -111,5 +120,18 @@ int fec_rx_recover(struct fec_rx_block *blk);
  * block slot index.  Returns block_seq_start + index * mss.
  */
 uint32_t fec_rx_seq_for_index(struct fec_rx_block *blk, int index);
+
+/*
+ * fec_rx_block_loss_pct – compute the loss percentage for the current
+ * RX block and update running counters.  Call when a block is complete
+ * (all parity received or timed out).  Returns 0–100.
+ */
+uint8_t fec_rx_block_loss_pct(struct fec_state *fs);
+
+/*
+ * fec_target_parity – decide how many parity packets to send based on
+ * the peer's reported loss rate.  Returns 0, 1, or 2.
+ */
+int fec_target_parity(uint8_t peer_loss_pct);
 
 #endif

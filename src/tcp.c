@@ -56,6 +56,7 @@ static void tcp_clear_queues(struct tcp_sock *tsk) {
     skb_queue_free(&tsk->ofo_queue);
 }
 
+
 /*
  * Ghost-inject a recovered packet into the TCP receive path.
  *
@@ -120,17 +121,35 @@ static void tcp_fec_handle_parity(struct sock *sk, struct sk_buff *skb,
     if (payload_len < FEC_HDR_LEN) goto drop;
 
     struct fec_hdr *fh = (struct fec_hdr *)th->data;
-    uint16_t block_id       = ntohs(fh->block_id);
-    uint8_t  parity_idx     = fh->seq_idx;
-    uint16_t symbol_len     = ntohs(fh->symbol_len);
+    uint8_t  parity_idx = fh->seq_idx;
+
+    /* ── Feedback packet from peer (receiver → sender) ── */
+    if (parity_idx == FEC_FEEDBACK_IDX) {
+        if (payload_len >= FEC_HDR_LEN + 1) {
+            uint8_t peer_loss = ((uint8_t *)th->data)[FEC_HDR_LEN];
+            fs->peer_loss_pct = peer_loss;
+            print_err("FEC-FB: received peer loss_pct=%u%% → target_parity=%d\n",
+                      peer_loss, fec_target_parity(peer_loss));
+        }
+        goto drop;
+    }
+
+    /* ── Regular parity packet ── */
+    uint16_t block_id        = ntohs(fh->block_id);
+    uint16_t symbol_len      = ntohs(fh->symbol_len);
     uint32_t block_seq_start = ntohl(fh->block_seq_start);
-    uint16_t sender_mss     = ntohs(fh->mss);
+    uint16_t sender_mss      = ntohs(fh->mss);
     uint16_t parity_data_len = payload_len - FEC_HDR_LEN;
 
     struct fec_rx_block *rxb = &fs->rx_block;
 
-    /* If this is a new block, reset */
+    /* If this is a new block, finalize the old one and reset */
     if (block_id != rxb->block_id) {
+        /* Finalize previous block: compute loss and send feedback */
+        if (rxb->seq_known) {
+            uint8_t loss = fec_rx_block_loss_pct(fs);
+            tcp_send_fec_feedback(sk, loss);
+        }
         fec_rx_reset_block(rxb, block_id);
     }
 
@@ -163,17 +182,10 @@ static void tcp_fec_handle_parity(struct sock *sk, struct sk_buff *skb,
             /* Ghost-inject every slot that was missing */
             for (int i = 0; i < RS_K; i++) {
                 uint32_t slot_seq = fec_rx_seq_for_index(rxb, i);
-                /* If this slot was just recovered (not originally present),
-                 * inject it into the TCP stream */
-                if (slot_seq >= tsk->tcb.rcv_nxt ||
-                    slot_seq + rxb->data_lens[i] > tsk->tcb.rcv_nxt) {
-                    /* Check if it was already in the receive/ofo queue
-                     * by looking at whether rcv_nxt has passed it */
-                    if (slot_seq >= tsk->tcb.rcv_nxt) {
-                        fec_inject_recovery(tsk, slot_seq,
-                                            rxb->data_bufs[i],
-                                            rxb->data_lens[i]);
-                    }
+                if (slot_seq >= tsk->tcb.rcv_nxt) {
+                    fec_inject_recovery(tsk, slot_seq,
+                                        rxb->data_bufs[i],
+                                        rxb->data_lens[i]);
                 }
             }
 
