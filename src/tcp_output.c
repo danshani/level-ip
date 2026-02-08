@@ -465,10 +465,9 @@ int tcp_connect(struct sock *sk)
  */
 static int tcp_send_fec_parity(struct sock *sk, uint16_t block_id,
                                uint8_t parity_idx, const uint8_t *parity_data,
-                               uint16_t parity_len, uint16_t symbol_len)
+                               uint16_t parity_len, uint16_t symbol_len,
+                               uint32_t block_seq_start, uint16_t mss)
 {
-    struct tcp_sock *tsk = tcp_sk(sk);
-    (void)tsk;
     uint16_t total = FEC_HDR_LEN + parity_len;
 
     struct sk_buff *skb = alloc_skb(ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN + total);
@@ -484,6 +483,8 @@ static int tcp_send_fec_parity(struct sock *sk, uint16_t block_id,
     fh->seq_idx = parity_idx;
     fh->pad_len = 0;
     fh->symbol_len = htons(symbol_len);
+    fh->block_seq_start = htonl(block_seq_start);
+    fh->mss = htons(mss);
     memcpy(skb->data + FEC_HDR_LEN, parity_data, parity_len);
 
     struct tcphdr *th = tcp_hdr(skb);
@@ -542,7 +543,8 @@ int tcp_send(struct tcp_sock *tsk, const void *buf, int len)
 
                 for (int p = 0; p < RS_PARITY; p++) {
                     tcp_send_fec_parity(sk, fblk->block_id, p,
-                                        parity_bufs[p], sym_len, sym_len);
+                                        parity_bufs[p], sym_len, sym_len,
+                                        fblk->data_seqs[0], mss);
                     free(parity_bufs[p]);
                 }
 

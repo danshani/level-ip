@@ -7,6 +7,7 @@
 #include "timer.h"
 #include "wait.h"
 #include "fec.h"
+#include "tcp_data.h"
 
 #ifdef DEBUG_TCP
 const char *tcp_dbg_states[] = {
@@ -56,6 +57,55 @@ static void tcp_clear_queues(struct tcp_sock *tsk) {
 }
 
 /*
+ * Ghost-inject a recovered packet into the TCP receive path.
+ *
+ * Allocates a fresh sk_buff with the recovered payload, sets the
+ * correct sequence number, and feeds it through tcp_data_queue()
+ * exactly like a normally received segment.  This advances rcv_nxt
+ * and triggers an ACK so the sender's window moves forward.
+ */
+static void fec_inject_recovery(struct tcp_sock *tsk, uint32_t seq,
+                                const uint8_t *payload, uint16_t len)
+{
+    struct tcb *tcb = &tsk->tcb;
+
+    /* Safety: only inject if the seq is inside the receive window */
+    if (seq < tcb->rcv_nxt) {
+        /* Already received / consumed — nothing to do */
+        return;
+    }
+    if (seq > tcb->rcv_nxt + tcb->rcv_wnd) {
+        print_err("FEC-INJECT: seq %u outside window [%u, %u), skipping\n",
+                  seq, tcb->rcv_nxt, tcb->rcv_nxt + tcb->rcv_wnd);
+        return;
+    }
+
+    /* Build a minimal sk_buff that tcp_data_queue() can consume */
+    int reserved = ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN + len;
+    struct sk_buff *skb = alloc_skb(reserved);
+    skb_reserve(skb, reserved);
+    skb->protocol = IP_TCP;
+
+    /* Push data payload */
+    skb_push(skb, len);
+    memcpy(skb->data, payload, len);
+
+    skb->seq     = seq;
+    skb->dlen    = len;
+    skb->len     = len;
+    skb->end_seq = seq + len;
+    skb->payload = skb->data;
+
+    /* Stamp a minimal TCP header so tcp_data_queue can read flags */
+    struct tcphdr *th = tcp_hdr(skb);
+    memset(th, 0, sizeof(*th));
+    th->ack = 1;
+
+    print_err("FEC-INJECT: injecting recovered pkt seq=%u len=%u\n", seq, len);
+    tcp_data_queue(tsk, th, skb);
+}
+
+/*
  * Handle an incoming FEC parity packet: extract fec_hdr, store parity,
  * and attempt reconstruction if enough data+parity is available.
  */
@@ -70,9 +120,11 @@ static void tcp_fec_handle_parity(struct sock *sk, struct sk_buff *skb,
     if (payload_len < FEC_HDR_LEN) goto drop;
 
     struct fec_hdr *fh = (struct fec_hdr *)th->data;
-    uint16_t block_id = ntohs(fh->block_id);
-    uint8_t parity_idx = fh->seq_idx;
-    uint16_t symbol_len = ntohs(fh->symbol_len);
+    uint16_t block_id       = ntohs(fh->block_id);
+    uint8_t  parity_idx     = fh->seq_idx;
+    uint16_t symbol_len     = ntohs(fh->symbol_len);
+    uint32_t block_seq_start = ntohl(fh->block_seq_start);
+    uint16_t sender_mss     = ntohs(fh->mss);
     uint16_t parity_data_len = payload_len - FEC_HDR_LEN;
 
     struct fec_rx_block *rxb = &fs->rx_block;
@@ -82,11 +134,25 @@ static void tcp_fec_handle_parity(struct sock *sk, struct sk_buff *skb,
         fec_rx_reset_block(rxb, block_id);
     }
 
+    /* Latch the block metadata from the first parity we see */
+    if (!rxb->seq_known) {
+        rxb->block_seq_start = block_seq_start;
+        rxb->mss = sender_mss;
+        rxb->seq_known = 1;
+        /* Back-fill seq numbers for data slots already received */
+        for (int i = 0; i < RS_K; i++) {
+            if (rxb->data_present[i] && !rxb->data_seqs[i]) {
+                rxb->data_seqs[i] = block_seq_start + (uint32_t)i * sender_mss;
+            }
+        }
+    }
+
     fec_rx_add_parity(rxb, parity_idx, th->data + FEC_HDR_LEN,
                       parity_data_len, symbol_len);
 
-    print_err("FEC-RX: Got parity block=%u idx=%u (data=%d parity=%d)\n",
-              block_id, parity_idx, rxb->data_count, rxb->parity_count);
+    print_err("FEC-RX: Got parity block=%u idx=%u (data=%d/%d parity=%d/%d)\n",
+              block_id, parity_idx, rxb->data_count, RS_K,
+              rxb->parity_count, RS_PARITY);
 
     /* Attempt recovery if we have gaps */
     if (rxb->data_count < RS_K && fec_rx_can_recover(rxb)) {
@@ -94,11 +160,25 @@ static void tcp_fec_handle_parity(struct sock *sk, struct sk_buff *skb,
             print_err("FEC-RX: Recovered missing packets in block %u!\n",
                       block_id);
 
-            /* Ghost-inject recovered packets into the TCP receive path.
-             * A full implementation would store per-packet seq numbers
-             * in fec_rx_block to synthesize proper sk_buffs and inject
-             * them via tcp_data_queue, then force an ACK.  This is the
-             * hook point for that logic. */
+            /* Ghost-inject every slot that was missing */
+            for (int i = 0; i < RS_K; i++) {
+                uint32_t slot_seq = fec_rx_seq_for_index(rxb, i);
+                /* If this slot was just recovered (not originally present),
+                 * inject it into the TCP stream */
+                if (slot_seq >= tsk->tcb.rcv_nxt ||
+                    slot_seq + rxb->data_lens[i] > tsk->tcb.rcv_nxt) {
+                    /* Check if it was already in the receive/ofo queue
+                     * by looking at whether rcv_nxt has passed it */
+                    if (slot_seq >= tsk->tcb.rcv_nxt) {
+                        fec_inject_recovery(tsk, slot_seq,
+                                            rxb->data_bufs[i],
+                                            rxb->data_lens[i]);
+                    }
+                }
+            }
+
+            /* Send an ACK to advance the sender's window */
+            tcp_send_ack(sk);
         }
     }
 
@@ -136,12 +216,29 @@ void tcp_in(struct sk_buff *skb)
 
     /* For data packets, also track them in the FEC RX block */
     if (tcp_sk(sk)->fec.enabled && skb->dlen > 0) {
-        struct fec_rx_block *rxb = &tcp_sk(sk)->fec.rx_block;
+        struct tcp_sock *tsk = tcp_sk(sk);
+        struct fec_rx_block *rxb = &tsk->fec.rx_block;
+
         /* Determine the data index within the current FEC block.
-         * This is a simplified mapping — in practice a more robust
-         * block-tracking mechanism would be needed. */
-        int idx = rxb->data_count;
-        if (idx < RS_K) {
+         * If we know the block_seq_start and mss (from a parity header),
+         * compute the exact index.  Otherwise, use sequential ordering
+         * and latch the first seq we see as block_seq_start. */
+        int idx = -1;
+        if (rxb->seq_known && rxb->mss > 0) {
+            /* Compute index from seq offset */
+            uint32_t offset = skb->seq - rxb->block_seq_start;
+            idx = (int)(offset / rxb->mss);
+        } else {
+            /* Sequential fallback: first packet sets the base */
+            if (!rxb->seq_known && rxb->data_count == 0) {
+                rxb->block_seq_start = skb->seq;
+                rxb->seq_known = 1;
+            }
+            idx = rxb->data_count;
+        }
+
+        if (idx >= 0 && idx < RS_K && !rxb->data_present[idx]) {
+            rxb->data_seqs[idx] = skb->seq;
             fec_rx_add_data(rxb, idx, skb->payload, skb->dlen);
         }
     }

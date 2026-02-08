@@ -10,10 +10,12 @@
  * The receiver uses this to associate the parity with the correct block.
  */
 struct fec_hdr {
-    uint16_t block_id;   /* FEC block number (monotonically increasing) */
-    uint8_t  seq_idx;    /* Index within the block (0..RS_PARITY-1 for parity) */
-    uint8_t  pad_len;    /* Original data length (so receiver knows real size) */
-    uint16_t symbol_len; /* Max payload length used for RS encoding */
+    uint16_t block_id;       /* FEC block number (monotonically increasing) */
+    uint8_t  seq_idx;        /* Index within the block (0..RS_PARITY-1 for parity) */
+    uint8_t  pad_len;        /* reserved / padding info */
+    uint16_t symbol_len;     /* Max payload length used for RS encoding */
+    uint32_t block_seq_start;/* TCP seq of first data packet in this block */
+    uint16_t mss;            /* MSS used by sender for seq reconstruction */
 } __attribute__((packed));
 
 #define FEC_HDR_LEN sizeof(struct fec_hdr)
@@ -36,6 +38,7 @@ struct fec_tx_block {
 struct fec_rx_block {
     uint16_t block_id;
     uint16_t symbol_len;            /* from fec_hdr of first parity seen */
+    uint16_t mss;                   /* sender MSS, from fec_hdr */
     int      data_count;
     int      parity_count;
     uint8_t  data_present[RS_K];    /* 1 if data slot i was received */
@@ -44,6 +47,8 @@ struct fec_rx_block {
     uint16_t data_lens[RS_K];
     uint8_t *parity_bufs[RS_PARITY];
     uint32_t block_seq_start;       /* seq number of first packet in block */
+    uint32_t data_seqs[RS_K];       /* per-slot TCP sequence numbers */
+    uint8_t  seq_known;             /* 1 once block_seq_start is set */
 };
 
 /*
@@ -100,5 +105,11 @@ int fec_rx_can_recover(struct fec_rx_block *blk);
  * Fills in missing data_bufs entries.  Returns 0 on success, -1 on failure.
  */
 int fec_rx_recover(struct fec_rx_block *blk);
+
+/*
+ * fec_rx_seq_for_index – compute the TCP sequence number for a given
+ * block slot index.  Returns block_seq_start + index * mss.
+ */
+uint32_t fec_rx_seq_for_index(struct fec_rx_block *blk, int index);
 
 #endif

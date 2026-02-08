@@ -43,12 +43,15 @@ void fec_rx_reset_block(struct fec_rx_block *blk, uint16_t new_id)
     }
     blk->block_id = new_id;
     blk->symbol_len = 0;
+    blk->mss = 0;
     blk->data_count = 0;
     blk->parity_count = 0;
     blk->block_seq_start = 0;
+    blk->seq_known = 0;
     memset(blk->data_present, 0, sizeof(blk->data_present));
     memset(blk->parity_present, 0, sizeof(blk->parity_present));
     memset(blk->data_lens, 0, sizeof(blk->data_lens));
+    memset(blk->data_seqs, 0, sizeof(blk->data_seqs));
 }
 
 int fec_tx_buffer_packet(struct fec_tx_block *blk, const uint8_t *payload,
@@ -192,4 +195,13 @@ int fec_rx_recover(struct fec_rx_block *blk)
     blk->data_count = RS_K;
 
     return 0;
+}
+
+uint32_t fec_rx_seq_for_index(struct fec_rx_block *blk, int index)
+{
+    /* If this slot was received normally, use its stored seq */
+    if (blk->data_seqs[index])
+        return blk->data_seqs[index];
+    /* Otherwise compute from block_seq_start + index * mss */
+    return blk->block_seq_start + (uint32_t)index * blk->mss;
 }
