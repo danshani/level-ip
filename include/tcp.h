@@ -4,6 +4,7 @@
 #include "ip.h"
 #include "timer.h"
 #include "utils.h"
+#include "fec.h"
 
 #define TCP_HDR_LEN sizeof(struct tcphdr)
 #define TCP_DOFFSET sizeof(struct tcphdr) / 4
@@ -105,7 +106,8 @@ struct tcphdr {
     uint16_t dport;
     uint32_t seq;
     uint32_t ack_seq;
-    uint8_t rsvd : 4;
+    uint8_t fec_flag : 1,  /* FEC_FLAG: 0=data, 1=parity packet */
+            rsvd : 3;
     uint8_t hl : 4;
     uint8_t fin : 1,
             syn : 1,
@@ -219,6 +221,8 @@ struct tcp_sock {
     uint8_t tsopt;
     
     struct sk_buff_head ofo_queue; /* Out-of-order queue */
+
+    struct fec_state fec; /* FEC (Reed-Solomon) state */
 };
 
 static inline struct tcphdr *tcp_hdr(const struct sk_buff *skb)
